@@ -1,0 +1,194 @@
+library(lhs)
+library(wordspace)
+library(foreach)
+library(umap)
+library(dplyr)
+library(ggplot2)
+library(stats)
+library(optparse)
+library(gplite)
+source("AEutils.R")
+
+set.seed(430)
+option_list <- list(
+  make_option(c("--n_tr"), type = "numeric", default = 1500,
+              help = "Number of training data *per existing class* [default: %default]"),
+  make_option(c("--n_ts"), type = "numeric", default = 3000,
+              help = "Number of testing data *per existing class* [default: %default]"),
+  make_option(c("--noc_tr"), type = "numeric", default = 50,
+              help = "Number of training data from other classes (in total) 
+              to include in training target GP model  [default: %default]"),
+  make_option(c("--val_fac"), type = "numeric", default = 0.8,
+              help = "The train/validation factor [default: %default]"),
+  make_option(c("-f", "--feature_size"), type = "numeric", default = 64,
+              help = "Number of features (X dimension) [default: %default]"),
+  make_option(c("-p", "--save_path"), type = "character", default = NULL,
+              help = "The directory to save files"),
+  make_option(c("--directory"), type = "character", default = "500New_Data_withGP_f64/task0-5",
+              help = "The directory to save files"),
+  make_option(c("--data_tr"), type = "character",
+              default = "500New_Data_withGP_f64/task0-4/out/f64_task0-4/filtered_train_sftmx.csv",
+              help = "The path to training dataset"),
+  make_option(c("--data_ts"), type = "character",
+              default = "500New_Data_withGP_f64/task0-4/out/f64_task0-4/test_sftmx.csv",
+              help = "The path to testing dataset"),
+  make_option(c("--nn_tr"), type = "numeric", default = 10000,
+              help = "Number of training data for each new class, 
+              use the max(nn_tr, new class training size) [default: %default]"),
+  make_option(c("--num_indpts"), type = "numeric", default = 500,
+              help = "Number of inducing points [default: %default]"),
+  make_option(c("--task"), type = "numeric", default = 4,
+              help = "Task name, train GP models for digit 0-task [default: %default]")
+)
+parser <- OptionParser(option_list = option_list)
+args <- parse_args(parser)
+
+f <- args$feature_size
+other_class_sample_num <- args$noc_tr
+nn_tr <- args$nn_tr # not used
+num_inducing <- args$num_indpts
+
+# Create save path
+if (is.null(args$save_path)){
+  dir <- paste0(args$directory,"/RData/")
+  args$save_path <- paste0(dir,"indpts_Rdata_ntr", 
+                           toString(args$n_tr), "_nts",
+                           toString(args$n_ts), "_noctr",
+                           toString(args$noc_tr), "_f",
+                           toString(args$feature_size))
+}
+prepare_save_dir(save_path=args$save_path)
+pdf(file = paste0(args$save_path, "/Rplots_train.pdf"))
+
+# Data dictionaries
+all_data_X <- list()
+all_data_Y <- list()
+val_data_X <- list()
+val_data_Y <- list()
+test_data_X <- list()
+test_data_Y <- list()
+test_data_label <- list() # for convenient
+NN_Y <- list() # NN cth column score for samples with label l, NN_Y["cc"]["cl"]
+
+GPmodel_train <- list()
+GPresult_train <- list()
+mse_train <- list()
+
+is_test <- FALSE
+
+existingclass_set <- as.list(0:args$task)
+if (is_test) {
+  load(paste0(args$save_path, "/GPmodel_train.RData"))
+} else {
+  #########  Train GP for existing class #########
+  # load data
+  df <- read.csv(args$data_tr)
+  # Separate train and val 
+  datasets <- split_train_val(df, "label", args$val_fac)
+  # datasets <- load_train_val_data(df, n_tr = n_tr, val_fac = args$val_fac)
+  train.df <- datasets$train.df
+  val.df <- datasets$val.df
+
+  inducing_points <- matrix(NA, nrow = 0, ncol = f)
+  inducing_points_GTlabels <- matrix(NA, nrow = 0, ncol = 1)
+
+  for (j in seq_along(existingclass_set)) {
+    label <- existingclass_set[[j]]
+    key <- paste0("c", label)
+
+    # other_class <- as.matrix(train.df[train.df[, "label"] %in% setdiff(existingclass_set, label), ])
+    # sampled_other <- random_select_rows(other_class, other_class_sample_num)
+    # other_class_val <- as.matrix(val.df[val.df[, "label"] %in% setdiff(existingclass_set, label), ])
+    # sampled_other_val <- random_select_rows(other_class_val, other_class_sample_num)
+
+    sampled_other <- load_classes_other_than_label(train.df, label, existingclass_set, other_class_sample_num)
+    sampled_other_val <- load_classes_other_than_label(val.df, label, existingclass_set, other_class_sample_num)
+    
+    current_data <- load_data_per_class(train.df, label, args$n_tr)
+    current_data_val <- load_data_per_class(val.df, label, args$n_tr)
+
+    all_data_X[[key]] <- current_data[, 1:f]
+    all_data_Y[[key]] <- current_data[, (f + j), drop = FALSE]
+    
+    val_data_X[[key]] <- current_data_val[, 1:f]
+    val_data_Y[[key]] <- current_data_val[, (f + j), drop = FALSE]
+
+    X <- rbind(all_data_X[[key]], sampled_other[, 1:f])
+    Y <- rbind(all_data_Y[[key]], sampled_other[, (f + j), drop = FALSE])
+    val.X <- rbind(val_data_X[[key]], sampled_other_val[, 1:f])
+    val.Y <- rbind(val_data_Y[[key]], sampled_other_val[, (f + j), drop = FALSE])
+
+    print(paste0("class ", label, " training sample size (indclude noc_tr other classes): ", nrow(X)))
+
+    ### train_GP: bind target class and other classes ###
+    # GPj <- train_GP(X=X, Y=Y, val.X=val.X, val.Y=val.Y, label=label, use_inducing = TRUE, num_inducing = num_inducing)
+    GPj <- train_GP_v2(X_t=all_data_X[[key]], X_otc=sampled_other[, 1:f], Y_t=all_data_Y[[key]], Y_otc=sampled_other[, (f + j), drop = FALSE],
+                       val.X=val.X, val.Y=val.Y,
+                       label=label, use_inducing = TRUE, num_inducing = num_inducing)
+
+    GPmodel_train[[key]] <- GPj$GPmodel
+    GPresult_train[[key]] <- GPj$GPresult
+    mse_train[[key]] <- GPj$mse
+    inducing_points <- rbind(inducing_points, GPj$inducing_points)
+    # assuming inducing points are all from the same class j [original points as inducing points]
+    inducing_points_GTlabels <- rbind(inducing_points_GTlabels, matrix(label, nrow = nrow(GPj$inducing_points), ncol = 1)) 
+
+    print(dim(inducing_points))
+    print(GPj$plot)
+    print(GPj$GPmodel)
+    gp_save(GPj$GPmodel, paste0(args$save_path, "/GPmodel_", key, ".rda"))
+  }
+  print("Train Finished")
+  print("---------------------")
+
+  # Save inducing points
+  write.csv(inducing_points, file=paste0(args$save_path, "/inducing_points.csv"), row.names = FALSE)
+  ## Inducing points Label assignment ##
+  # option 1: build pred matrix
+  # indcpts_pred_mat <- build_inducing_pts_pred_matrix(inducing_points, GPmodel_train)
+  # option 2: save GT labels)
+  indcpts_pred_mat <- data.frame(inducing_points, label = inducing_points_GTlabels)
+  write.csv(indcpts_pred_mat, file=paste0(args$save_path, "/indcpts_pred_mat.csv"), row.names = FALSE)
+  print("Inducing Points Saved")
+  print("---------------------")
+}
+
+# test GPs
+test.df <- read.csv(args$data_ts)
+n_ts <- (args$n_ts) * (args$task + 1)
+  print(paste0("Expected testing data total: ", n_ts))
+if (n_ts > nrow(test.df)) {
+    print(paste0("n_ts is greater than the number of rows in the data frame, using all rows:", nrow(test.df)))
+    n_ts <- nrow(test.df)
+}
+test.df <- test.df[1:n_ts, ]
+print(paste0("total test df size: ", nrow(test.df)))
+
+str(test.df$label)
+table(test.df$label)
+test.df$label <- as.numeric(as.character(test.df$label))
+for (j in seq_along(existingclass_set)) {
+  label <- j - 1
+  key <- paste0("c", label)
+  test_df <- test.df[test.df$label == label, ]
+  test_data_X[[key]] <- as.matrix(test_df[, 1:f])
+  test_data_Y[[key]] <- matrix(test_df[, (f + j)])
+  test_data_label[[key]] <- matrix(label, nrow = nrow(test_data_X[[key]]), ncol=1)
+  print(paste0("class ", label, " test data size:", nrow(test_df)))
+}
+
+testsets <- do.call(rbind, lapply(c(paste0("c", existingclass_set)), function(index) test_data_X[[index]]))
+testsets_labels <- do.call(rbind, lapply(c(paste0("c", existingclass_set)), function(index) test_data_label[[index]]))
+
+print(paste0("Testset GPs:"))
+test_result <- test_GPs(GPmodels=GPmodel_train, test_classes=existingclass_set, GPs=existingclass_set, test_data=testsets, test_data_label=testsets_labels)
+print_GP_distributions_stats(test_result$GP_test_mean_mat_with_label)
+test_result_plots <- plot_GP_distributions(test_result$GP_test_mean_mat_with_label, 
+                    normal_plot_title="output distribution on different classes (testset)", normal_ymin=0, normal_ymax=0.1,
+                    histogram_plot_title="histogram of predGPsep scores by class (testset)", histogram_ymin=0, histogram_ymax=600)
+
+save(file = paste0(args$save_path, "/GPmodel_train.RData"), GPmodel_train, GPresult_train, mse_train, train.df, val.df, all_data_X, all_data_Y, val_data_X, val_data_Y, test_data_X, test_data_Y, test_data_label)
+
+print("Save Results")
+dev.off()
+
