@@ -143,7 +143,7 @@ print(paste0("Optimal GPc for new class ", new_class, " is: compress GP", optima
 print("---------------------")
 
 
-# Plot, example for GP2
+####  Plot, example for GP2 ####
 print("Plot an Example - GP2")
 X_0 <- all_data_X[["c0"]]
 X_1 <- all_data_X[["c1"]]

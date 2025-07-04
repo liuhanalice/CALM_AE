@@ -7,7 +7,7 @@ library(ggplot2)
 library(stats)
 library(optparse)
 library(gplite)
-source("AEutils.R")
+source("utils.R")
 
 set.seed(430)
 option_list <- list(
