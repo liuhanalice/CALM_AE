@@ -13,7 +13,7 @@ set.seed(430)
 option_list <- list(
   make_option(c("--n_tr"), type = "numeric", default = 1500,
               help = "Number of training data *per existing class* [default: %default]"),
-  make_option(c("--n_ts"), type = "numeric", default = 3000,
+  make_option(c("--n_ts"), type = "numeric", default = 1000,
               help = "Number of testing data *per existing class* [default: %default]"),
   make_option(c("--noc_tr"), type = "numeric", default = 50,
               help = "Number of training data from other classes (in total) 
@@ -32,20 +32,16 @@ option_list <- list(
   make_option(c("--data_ts"), type = "character",
               default = "500New_Data_withGP_f64/task0-4/out/f64_task0-4/test_sftmx.csv",
               help = "The path to testing dataset"),
-  make_option(c("--nn_tr"), type = "numeric", default = 10000,
-              help = "Number of training data for each new class, 
-              use the max(nn_tr, new class training size) [default: %default]"),
-  make_option(c("--num_indpts"), type = "numeric", default = 500,
+  make_option(c("--num_indpts"), type = "numeric", default = 1000,
               help = "Number of inducing points [default: %default]"),
-  make_option(c("--task"), type = "numeric", default = 4,
-              help = "Task name, train GP models for digit 0-task [default: %default]")
+  make_option(c("--last_class"), type = "numeric", default = 4,
+              help = "Existing classes are 0-last_class, train GP models for digit 0-last_class [default: %default]")
 )
 parser <- OptionParser(option_list = option_list)
 args <- parse_args(parser)
 
 f <- args$feature_size
 other_class_sample_num <- args$noc_tr
-nn_tr <- args$nn_tr # not used
 num_inducing <- args$num_indpts
 
 # Create save path
@@ -76,30 +72,29 @@ mse_train <- list()
 
 is_test <- FALSE
 
-existingclass_set <- as.list(0:args$task)
+existingclass_set <- as.list(0:args$last_class)
+
 if (is_test) {
   load(paste0(args$save_path, "/GPmodel_train.RData"))
 } else {
-  #########  Train GP for existing class #########
-  # load data
+  #########  Train GP for existing classes #########
+  
+  # Load data
   df <- read.csv(args$data_tr)
+  
   # Separate train and val 
   datasets <- split_train_val(df, "label", args$val_fac)
-  # datasets <- load_train_val_data(df, n_tr = n_tr, val_fac = args$val_fac)
   train.df <- datasets$train.df
   val.df <- datasets$val.df
 
+  # Init inducing points and labels matrices
   inducing_points <- matrix(NA, nrow = 0, ncol = f)
   inducing_points_GTlabels <- matrix(NA, nrow = 0, ncol = 1)
 
-  for (j in seq_along(existingclass_set)) {
-    label <- existingclass_set[[j]]
+  # Train GP models for each existing class
+  for (j in seq_along(existingclass_set)) { # j = 1,2,3,4, ...
+    label <- existingclass_set[[j]] # label = 0,1,2,3, ...
     key <- paste0("c", label)
-
-    # other_class <- as.matrix(train.df[train.df[, "label"] %in% setdiff(existingclass_set, label), ])
-    # sampled_other <- random_select_rows(other_class, other_class_sample_num)
-    # other_class_val <- as.matrix(val.df[val.df[, "label"] %in% setdiff(existingclass_set, label), ])
-    # sampled_other_val <- random_select_rows(other_class_val, other_class_sample_num)
 
     sampled_other <- load_classes_other_than_label(train.df, label, existingclass_set, other_class_sample_num)
     sampled_other_val <- load_classes_other_than_label(val.df, label, existingclass_set, other_class_sample_num)
@@ -122,7 +117,7 @@ if (is_test) {
 
     ### train_GP: bind target class and other classes ###
     # GPj <- train_GP(X=X, Y=Y, val.X=val.X, val.Y=val.Y, label=label, use_inducing = TRUE, num_inducing = num_inducing)
-    GPj <- train_GP_v2(X_t=all_data_X[[key]], X_otc=sampled_other[, 1:f], Y_t=all_data_Y[[key]], Y_otc=sampled_other[, (f + j), drop = FALSE],
+    GPj <- train_GP_v3(X_t=all_data_X[[key]], X_otc=sampled_other[, 1:f], Y_t=all_data_Y[[key]], Y_otc=sampled_other[, (f + j), drop = FALSE],
                        val.X=val.X, val.Y=val.Y,
                        label=label, use_inducing = TRUE, num_inducing = num_inducing)
 
@@ -135,7 +130,6 @@ if (is_test) {
 
     print(dim(inducing_points))
     print(GPj$plot)
-    print(GPj$GPmodel)
     gp_save(GPj$GPmodel, paste0(args$save_path, "/GPmodel_", key, ".rda"))
   }
   print("Train Finished")
@@ -153,9 +147,9 @@ if (is_test) {
   print("---------------------")
 }
 
-# test GPs
+#########  Test GP for existing classes #########
 test.df <- read.csv(args$data_ts)
-n_ts <- (args$n_ts) * (args$task + 1)
+n_ts <- (args$n_ts) * (args$last_class + 1)
   print(paste0("Expected testing data total: ", n_ts))
 if (n_ts > nrow(test.df)) {
     print(paste0("n_ts is greater than the number of rows in the data frame, using all rows:", nrow(test.df)))
@@ -187,6 +181,7 @@ test_result_plots <- plot_GP_distributions(test_result$GP_test_mean_mat_with_lab
                     normal_plot_title="output distribution on different classes (testset)", normal_ymin=0, normal_ymax=0.1,
                     histogram_plot_title="histogram of predGPsep scores by class (testset)", histogram_ymin=0, histogram_ymax=600)
 
+#########  Save Structured Result #########
 save(file = paste0(args$save_path, "/GPmodel_train.RData"), GPmodel_train, GPresult_train, mse_train, train.df, val.df, all_data_X, all_data_Y, val_data_X, val_data_Y, test_data_X, test_data_Y, test_data_label)
 
 print("Save Results")
