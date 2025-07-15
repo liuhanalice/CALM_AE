@@ -6,6 +6,7 @@ library(dplyr)
 library(ggplot2)
 library(stats)
 library(gplite)
+library(laGP)
 
 # Select num_rows of from matrix mat randomly
 random_select_rows <- function(mat, num_rows) {
@@ -232,8 +233,8 @@ train_GP_v3 <- function(X_t, X_otc, Y_t, Y_otc, val.X, val.Y, label, use_inducin
     # num_inducing only for target class (X_t)
     Z_t <- X_t[sample(1:nrow(X_t), num_inducing), , drop = FALSE]
 
-    # gp_model <- gp_init(cf_sexp(), method = method_fitc(inducing = Z_t))
-    gp_model <- gp_init(cf_sexp(), lik = lik_gaussian(), method = method_full()) # TODO: test not training with inducing points
+    gp_model <- gp_init(cf_sexp(), method = method_fitc(inducing = Z_t))
+    # gp_model <- gp_init(cf_sexp(), lik = lik_gaussian(), method = method_full()) # TODO: test not training with inducing points
   }
   else{
     gp_model <- gp_init(cf_sexp(), lik = lik_gaussian(), method = method_full())
@@ -266,8 +267,64 @@ train_GP_v3 <- function(X_t, X_otc, Y_t, Y_otc, val.X, val.Y, label, use_inducin
 }
 
 
+# Train GP version 3: num_inducing are inducing points for **target class**
+train_GP_laGP <- function(X_t, X_otc, Y_t, Y_otc, val.X, val.Y, label, use_inducing, num_inducing) {
+  if (nrow(val.X) != nrow(val.Y)) {
+    stop("Number of rows in val.X and val.Y must be equal")
+  }
+  # X_otc len = 50
+  X <- rbind(X_t, X_otc)
+  Y <- rbind(Y_t, Y_otc)
+
+  if (! is.matrix(X) || ! is.matrix(Y)) {
+    stop("X and Y must be matrices")
+  }
+  if (nrow(X) != nrow(Y)) {
+    stop("Number of rows in X and Y must be equal")
+  }
+  
+  # laGP, not using inducing points, but sample some points to save as "inducing/sampling reference points"
+  gp_model <- newGPsep(X=X, Z=Y, d = rep(10, ncol(X)), g = 1e-6, dK = TRUE)
+  mleGPsep(gp_model, param = "both") # tmin and tmax by default, see laGP reference
+  
+  out <- predGPsep(gp_model, X)
+  out.val <- predGPsep(gp_model, val.X)
+
+  num_total_points <- nrow(X)
+  
+  if (use_inducing){
+    if(num_inducing > nrow(X_t)){
+      num_inducing <- nrow(X_t)
+      print(paste0("Selecting ", num_inducing, " inducing points"))
+    }
+    # use manually selected inducing points(randomly selected)
+    set.seed(42)
+    # num_inducing only for target class (X_t)
+    Z_t <- X_t[sample(1:nrow(X_t), num_inducing), , drop = FALSE]
+
+     inducing_points <- Z_t
+  }
+  else { # return all training points
+    inducing_points <- X_t
+  }
+
+  mse <- norm(out.val$mean - val.Y, "2")
+  print(paste0("validation MSE for class", label, ": ", mse))
+
+  # train vs. val MSE plot
+  plot_df <- data.frame(Y_true = as.numeric(val.Y), Y_pred = out.val$mean)
+  plot <- ggplot(plot_df, aes(x = Y_true, y = Y_pred)) +
+    geom_point() +
+    ggtitle(paste0("Validation True vs. Pred (class=", label, ")")) +
+    xlab("Y_true") + ylab("Y_pred")
+
+  return(list(GPmodel = gp_model, GPresult = out, mse = mse, plot = plot, inducing_points = inducing_points))
+}
+
+
+
 # Test GP models
-test_GPs <- function(GPmodels, test_classes, GPs, test_data, test_data_label) {
+test_GPs <- function(GPmodels, test_classes, GPs, test_data, test_data_label, gp_package = 'gplite') {
   if (! is.list(GPmodels)) {
     stop("GPmodels must be a list (dictionaries)")
   }
@@ -284,7 +341,14 @@ test_GPs <- function(GPmodels, test_classes, GPs, test_data, test_data_label) {
       stop(paste0("GP model for class ", label, " not found"))
     }
 
-    out.test <- gp_pred(GPmodels[[key]], test_data, jitter = 1e-4)
+    if (gp_package == 'gplite') {
+      out.test <- gp_pred(GPmodels[[key]], test_data, jitter = 1e-4)
+    } else if (gp_package == 'laGP') {
+      out.test <- predGPsep(GPmodels[[key]], test_data)
+    } else {
+      stop("Unsupported GP package. Use 'gplite' or 'laGP'.")
+    }
+
     GP_test_mean_mat[, j] <- out.test$mean
   }
   colnames(GP_test_mean_mat) <- paste0("c", GPs)
@@ -411,9 +475,20 @@ plot_GP_distributions <- function(GP_mean_mat_with_label, normal_plot_title, nor
 
 # Build inducing points prediction matrix
 # given inducing points matrix(X) and GP models, predict the labels for the inducing points
-build_inducing_pts_pred_matrix <- function(indcpts_matrix, GPmodels) {
-  predict_gp <- function(models, data) {
-    predictions <- sapply(models, function(model) gp_pred(model, data, jitter = 1e-4)$mean)
+build_inducing_pts_pred_matrix <- function(indcpts_matrix, GPmodels, gp_package = 'gplite') {
+  # predict_gp <- function(models, data) {
+  #   if (gp_package)
+  #   predictions <- sapply(models, function(model) gp_pred(model, data, jitter = 1e-4)$mean)
+  #   return(predictions)
+  # }
+
+  predict_gp <- function(models, data, gp_package = c("gplite", "laGP"), jitter = 1e-4) {
+    gp_package <- match.arg(gp_package) # validate gp_package input
+    gp_prediction <- switch(gp_package,
+      gplite = function(model, data) gp_pred(model, data, jitter = jitter),
+      laGP   = function(model, data) predGPsep(model, data)
+    )
+    predictions <- sapply(models, function(model) gp_prediction(model, data)$mean)
     return(predictions)
   }
 

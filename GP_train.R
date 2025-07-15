@@ -7,6 +7,7 @@ library(ggplot2)
 library(stats)
 library(optparse)
 library(gplite)
+library(laGP)
 source("utils.R")
 
 set.seed(430)
@@ -15,7 +16,7 @@ option_list <- list(
               help = "Number of training data *per existing class* [default: %default]"),
   make_option(c("--n_ts"), type = "numeric", default = 1000,
               help = "Number of testing data *per existing class* [default: %default]"),
-  make_option(c("--noc_tr"), type = "numeric", default = 50,
+  make_option(c("--n_octr"), type = "numeric", default = 50,
               help = "Number of training data from other classes (in total) 
               to include in training target GP model  [default: %default]"),
   make_option(c("--val_fac"), type = "numeric", default = 0.8,
@@ -32,17 +33,24 @@ option_list <- list(
   make_option(c("--data_ts"), type = "character",
               default = "500New_Data_withGP_f64/task0-4/out/f64_task0-4/test_sftmx.csv",
               help = "The path to testing dataset"),
-  make_option(c("--num_indpts"), type = "numeric", default = 1000,
+  make_option(c("--n_indcpts"), type = "numeric", default = 1000,
               help = "Number of inducing points [default: %default]"),
   make_option(c("--last_class"), type = "numeric", default = 4,
-              help = "Existing classes are 0-last_class, train GP models for digit 0-last_class [default: %default]")
+              help = "Existing classes are 0-last_class, train GP models for digit 0-last_class [default: %default]"),
+  make_option(c("--use_Y_logspace"), type = "logical", default = FALSE,
+            help = "Whether to apply log-space transform to Y values (TRUE or FALSE) [default: %default]"),
+  make_option(c("--GP_package"), type = "character", default = "gplite",
+              help = "The package to use for GP training (gplite or laGP) [default: %default]")
 )
 parser <- OptionParser(option_list = option_list)
 args <- parse_args(parser)
 
 f <- args$feature_size
-other_class_sample_num <- args$noc_tr
-num_inducing <- args$num_indpts
+other_class_sample_num <- args$n_octr
+num_inducing <- args$n_indcpts
+GP_package <- args$GP_package
+
+# print(paste0("DEBUG: ", "n_tr=", args$n_tr, ", n_ts=", args$n_ts, ", n_octr=", args$n_octr, ", n_indcpts=", args$n_indcpts, ", f_size=", args$feature_size))
 
 # Create save path
 if (is.null(args$save_path)){
@@ -50,7 +58,7 @@ if (is.null(args$save_path)){
   args$save_path <- paste0(dir,"indpts_Rdata_ntr", 
                            toString(args$n_tr), "_nts",
                            toString(args$n_ts), "_noctr",
-                           toString(args$noc_tr), "_f",
+                           toString(args$n_octr), "_f",
                            toString(args$feature_size))
 }
 prepare_save_dir(save_path=args$save_path)
@@ -87,6 +95,15 @@ if (is_test) {
   train.df <- datasets$train.df
   val.df <- datasets$val.df
 
+  # Use log-space (log1p) transform for Y values if specified
+  if (args$use_Y_logspace) {
+    train.df[, (f + 1): (ncol(train.df)-1)] <- log1p(train.df[, (f + 1): (ncol(train.df)-1)])
+    val.df[, (f + 1): (ncol(val.df)-1)] <- log1p(val.df[, (f + 1): (ncol(val.df)-1)])
+    print("Using log-space transform for Y values")
+  } else {
+    print("Using original Y values (no log-space transform)")
+  }
+
   # Init inducing points and labels matrices
   inducing_points <- matrix(NA, nrow = 0, ncol = f)
   inducing_points_GTlabels <- matrix(NA, nrow = 0, ncol = 1)
@@ -113,13 +130,22 @@ if (is_test) {
     val.X <- rbind(val_data_X[[key]], sampled_other_val[, 1:f])
     val.Y <- rbind(val_data_Y[[key]], sampled_other_val[, (f + j), drop = FALSE])
 
-    print(paste0("class ", label, " training sample size (indclude noc_tr other classes): ", nrow(X)))
+    print(paste0("class ", label, " training sample size (indclude n_octr other classes): ", nrow(X)))
+    # print(paste0("DEBUG: j=", j, "," , dim(all_data_X[[key]]), ", ", dim(sampled_other[, 1:f]), ", ", dim(all_data_Y[[key]]), ", ", dim(sampled_other[, (f + j), drop = FALSE]), ", ", dim(val.X), ", ", dim(val.Y)))
 
     ### train_GP: bind target class and other classes ###
     # GPj <- train_GP(X=X, Y=Y, val.X=val.X, val.Y=val.Y, label=label, use_inducing = TRUE, num_inducing = num_inducing)
-    GPj <- train_GP_v3(X_t=all_data_X[[key]], X_otc=sampled_other[, 1:f], Y_t=all_data_Y[[key]], Y_otc=sampled_other[, (f + j), drop = FALSE],
-                       val.X=val.X, val.Y=val.Y,
-                       label=label, use_inducing = TRUE, num_inducing = num_inducing)
+    if (GP_package == 'gplite') {
+      print("Using gplite package for GP training")
+      GPj <- train_GP_v3(X_t=all_data_X[[key]], X_otc=sampled_other[, 1:f], Y_t=all_data_Y[[key]], Y_otc=sampled_other[, (f + j), drop = FALSE],
+                        val.X=val.X, val.Y=val.Y,
+                        label=label, use_inducing = TRUE, num_inducing = num_inducing)
+    } else if (GP_package == 'laGP') {
+      print("Using laGP package for training")
+      GPj <- train_GP_laGP(X_t=all_data_X[[key]], X_otc=sampled_other[, 1:f], Y_t=all_data_Y[[key]], Y_otc=sampled_other[, (f + j), drop = FALSE],
+                        val.X=val.X, val.Y=val.Y,
+                        label=label, use_inducing = TRUE, num_inducing = num_inducing)
+    }
 
     GPmodel_train[[key]] <- GPj$GPmodel
     GPresult_train[[key]] <- GPj$GPresult
@@ -175,7 +201,7 @@ testsets <- do.call(rbind, lapply(c(paste0("c", existingclass_set)), function(in
 testsets_labels <- do.call(rbind, lapply(c(paste0("c", existingclass_set)), function(index) test_data_label[[index]]))
 
 print(paste0("Testset GPs:"))
-test_result <- test_GPs(GPmodels=GPmodel_train, test_classes=existingclass_set, GPs=existingclass_set, test_data=testsets, test_data_label=testsets_labels)
+test_result <- test_GPs(GPmodels=GPmodel_train, test_classes=existingclass_set, GPs=existingclass_set, test_data=testsets, test_data_label=testsets_labels, gp_package = GP_package)
 print_GP_distributions_stats(test_result$GP_test_mean_mat_with_label)
 test_result_plots <- plot_GP_distributions(test_result$GP_test_mean_mat_with_label, 
                     normal_plot_title="output distribution on different classes (testset)", normal_ymin=0, normal_ymax=0.1,
